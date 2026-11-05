@@ -5,6 +5,9 @@ import { getForecast, weatherSnapshot, dirToDeg, SKY_LABEL, skyBucket } from './
 import { sunTimes } from './sun.js';
 import { suggest, summarizeWindow, detectPostFront, pickPhase } from './suggest.js';
 import { computeStats, smallSample, tripHours } from './stats.js';
+import { ATTRACTORS, ATTRACTOR_TYPES, ATTRACTOR_SOURCE } from './attractors.js';
+import { distM, bearing, cardinal, fmtDist, lakeForPoint, toGPX, readWaypointsFile } from './geo.js';
+import { createMap, SPOT_TYPES, spotType, SPECIES_COLOR } from './map.js';
 
 // ---------- helpers ----------
 const $ = (s, el = document) => el.querySelector(s);
@@ -31,7 +34,9 @@ function toast(msg, ms = 2800) {
 const DEFAULT_SETTINGS = { windCaution: 10, windNoGo: 16, gustNoGo: 25, autoGps: false, lakeOverrides: {} };
 let settings = { ...DEFAULT_SETTINGS };
 let plan = { lakeId: 'jacomo', dayOffset: 0, startHour: 6, endHour: 12, species: 'walleye', waterTemp: null, clarity: '', postFront: 'auto' };
-let data = { trips: [], catches: [] };
+let data = { trips: [], catches: [], spots: [] };
+let attractorOverrides = {}; // lakeId -> { points: [[lat, lon, desc]], importedAt } from a newer MDC file
+let mapState = { ctl: null, creating: false, lakeId: null, base: 'sat', show: { spots: true, catches: true, attractors: true }, view: null, follow: false, centerOnFix: false, listAt: 0 };
 let wxCache = {}; // lakeId -> forecast result
 let wxLoading = {};
 let wxError = {};
@@ -49,10 +54,73 @@ function enrichedCatches() {
 }
 
 async function loadData() {
-  const [trips, catches] = await Promise.all([db.all('trips'), db.all('catches')]);
+  const [trips, catches, spots] = await Promise.all([db.all('trips'), db.all('catches'), db.all('spots')]);
   data.trips = trips.sort((a, b) => Date.parse(b.start) - Date.parse(a.start));
   data.catches = catches.sort((a, b) => Date.parse(b.time) - Date.parse(a.time));
+  data.spots = spots.sort((a, b) => a.name.localeCompare(b.name));
 }
+
+// ---------- spots / location helpers ----------
+const spotById = (id) => data.spots.find((s) => s.id === id);
+const SPOT_RADIUS_M = 75; // a catch within this distance of a spot counts as "at" the spot
+/** Where a catch was: its own GPS, else the saved spot it was tagged with. */
+function catchPos(c) {
+  if (c.lat != null && c.lon != null) return { lat: c.lat, lon: c.lon };
+  const s = c.spotId && spotById(c.spotId);
+  return s ? { lat: s.lat, lon: s.lon } : null;
+}
+function catchesAtSpot(spot) {
+  return enrichedCatches().filter((c) => {
+    if (c.spotId === spot.id) return true;
+    if (c.spotId) return false; // tagged to a different spot
+    const p = catchPos(c);
+    return p && distM(p, spot) <= SPOT_RADIUS_M;
+  });
+}
+/** The spot a catch belongs to (tagged, else nearest within the radius). */
+function spotForCatch(c) {
+  if (c.spotId) return spotById(c.spotId) || null;
+  const p = catchPos(c);
+  if (!p) return null;
+  let best = null, bd = Infinity;
+  for (const s of data.spots) { const d = distM(p, s); if (d < bd) { bd = d; best = s; } }
+  return bd <= SPOT_RADIUS_M ? best : null;
+}
+function attractorsFor(lakeId) {
+  const o = attractorOverrides[lakeId];
+  if (o) return o.points.map(([lat, lon, desc]) => ({ lat, lon, desc }));
+  return (ATTRACTORS[lakeId] || []).map(([lat, lon, t]) => ({ lat, lon, desc: ATTRACTOR_TYPES[t] }));
+}
+
+// Shared GPS watch: runs only while something on screen needs it (map tab, spot guide).
+let here = null; // { lat, lon, acc, heading, speed, t }
+let geoWatch = null, geoError = null;
+const geoSubs = new Map();
+function geoSubscribe(key, fn) {
+  geoSubs.set(key, fn);
+  if (geoWatch != null || !navigator.geolocation) return;
+  geoWatch = navigator.geolocation.watchPosition((p) => {
+    here = { lat: p.coords.latitude, lon: p.coords.longitude, acc: p.coords.accuracy, heading: p.coords.heading, speed: p.coords.speed, t: Date.now() };
+    geoError = null;
+    geoSubs.forEach((f) => f());
+  }, (e) => { geoError = e.message || 'Location unavailable'; geoSubs.forEach((f) => f()); }, { enableHighAccuracy: true, maximumAge: 5000, timeout: 30000 });
+}
+function geoUnsubscribe(key) {
+  geoSubs.delete(key);
+  if (!geoSubs.size && geoWatch != null) { navigator.geolocation.clearWatch(geoWatch); geoWatch = null; }
+}
+/** One fresh position (reuses the live watch if it's recent). */
+function currentPosition() {
+  if (here && Date.now() - here.t < 15000) return Promise.resolve(here);
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) { reject(new Error('GPS not available')); return; }
+    navigator.geolocation.getCurrentPosition((p) => {
+      here = { lat: p.coords.latitude, lon: p.coords.longitude, acc: p.coords.accuracy, heading: p.coords.heading, speed: p.coords.speed, t: Date.now() };
+      resolve(here);
+    }, (e) => reject(new Error(e.message || 'Location unavailable')), { enableHighAccuracy: true, timeout: 20000, maximumAge: 10000 });
+  });
+}
+const distLabel = (p) => { if (!here || !p) return ''; const b = bearing(here, p); return `${fmtDist(distM(here, p))} ${cardinal(b)}`; };
 const savePlan = () => db.kvSet('plan', plan);
 const saveSettings = () => db.kvSet('settings', settings);
 
@@ -64,8 +132,286 @@ async function render() {
   const r = route();
   document.querySelectorAll('nav.tabs a').forEach((a) => a.classList.toggle('on', a.dataset.r === r));
   const main = $('#main');
+  if (r === 'map') { await renderMapTab(); return; }
+  if (mapState.ctl) teardownMap();
   if (r === 'trip') { main.innerHTML = await renderTrip(routeArg()); return; }
   main.innerHTML = await (routes[r] || renderPlan)();
+}
+
+// ---------- MAP ----------
+const saveMapPrefs = () => db.kvSet('mapPrefs', { lakeId: mapState.lakeId, base: mapState.base, show: mapState.show, view: mapState.view });
+
+function teardownMap() {
+  if (!mapState.ctl) return;
+  mapState.view = mapState.ctl.view();
+  saveMapPrefs();
+  mapState.ctl.destroy();
+  mapState.ctl = null;
+  geoUnsubscribe('map');
+}
+
+function mapCatchList() {
+  return enrichedCatches().map((c) => {
+    const p = catchPos(c);
+    if (!p) return null;
+    const s = spotForCatch(c);
+    return { ...p, species: c.species, popup: `<b>${esc(speciesName(c.species))}${c.lengthIn ? ` ${c.lengthIn}"` : ''}${c.weightLb ? ` ${c.weightLb} lb` : ''}</b><br>${esc(lureLabel(c.lureType))}${c.lureName ? ` (${esc(c.lureName)})` : ''}${c.color ? `, ${esc(c.color)}` : ''}${c.depthFt != null ? ` · ${c.depthFt} ft` : ''}<br><span class="muted">${fmtDateTime(c.time)}${s ? ` · ${esc(s.name)}` : ''}</span>` };
+  }).filter(Boolean);
+}
+
+function mapAttractorList(lakeId) {
+  return attractorsFor(lakeId).map((a) => ({ ...a, popup: `<b>MDC fish attractor</b><br>${esc(a.desc || 'Type not listed')}<br><span class="muted">${a.lat.toFixed(5)}, ${a.lon.toFixed(5)}</span><br><button class="btn ghost small" data-act="attr2spot" data-lat="${a.lat}" data-lon="${a.lon}" data-desc="${esc(a.desc)}">Save as my spot</button>` }));
+}
+
+function mapRefreshLayers() {
+  const c = mapState.ctl;
+  if (!c) return;
+  c.setSpots(data.spots);
+  c.setCatches(mapCatchList());
+  c.setAttractors(mapAttractorList(mapState.lakeId));
+  for (const k of Object.keys(mapState.show)) c.show(k, mapState.show[k]);
+  if (here) c.setMe(here);
+}
+
+function mapChrome() {
+  const lake = lakeById(mapState.lakeId);
+  const spotsHere = data.spots.filter((s) => s.lakeId === lake.id).length;
+  const catchesWithPos = enrichedCatches().filter((c) => catchPos(c)).length;
+  const attrN = attractorsFor(lake.id).length;
+  $('#map-lakes').innerHTML = lakes().map((l) => `<button class="chip ${l.id === lake.id ? 'on' : ''}" data-act="maplake" data-v="${l.id}">${esc(l.name)}</button>`).join('');
+  const layerChip = (k, label) => `<button class="chip ${mapState.show[k] ? 'on' : ''}" data-act="maplayer" data-v="${k}" aria-pressed="${mapState.show[k]}">${label}</button>`;
+  $('#map-layers').innerHTML = layerChip('spots', `My spots (${spotsHere})`) + layerChip('catches', `My catches (${catchesWithPos})`) + layerChip('attractors', `MDC attractors (${attrN})`);
+  const zoomedOut = mapState.ctl && mapState.ctl.map.getZoom() < mapState.ctl.attrMinZoom;
+  $('#map-hint').innerHTML = [
+    mapState.show.attractors && attrN && zoomedOut ? 'Zoom in to see the MDC attractors.' : '',
+    'Long-press the map to save a spot anywhere.',
+    geoError ? `Location: ${esc(geoError)}` : '',
+  ].filter(Boolean).join(' ');
+  $('#mapbase').textContent = mapState.base === 'sat' ? '🗺 Street' : '🛰 Satellite';
+  renderSpotList();
+}
+
+function renderSpotList() {
+  const el = $('#map-spots');
+  if (!el) return;
+  mapState.listAt = Date.now();
+  const lake = lakeById(mapState.lakeId);
+  const sortByDist = (arr) => (here ? [...arr].sort((a, b) => distM(here, a) - distM(here, b)) : arr);
+  const row = (s) => {
+    const n = catchesAtSpot(s).length;
+    return `<li><button class="rowbtn" data-act="openspot" data-id="${s.id}">
+      <b>${spotType(s.type).icon} ${esc(s.name)}</b>
+      <span class="small">${esc(spotType(s.type).name)}${s.depthFt != null ? ` · ${s.depthFt} ft` : ''}${n ? ` · ${n} fish` : ''}</span>
+      ${here ? `<span class="small muted">${distLabel(s)}</span>` : ''}
+    </button></li>`;
+  };
+  const mine = sortByDist(data.spots.filter((s) => s.lakeId === lake.id));
+  const other = sortByDist(data.spots.filter((s) => !s.lakeId));
+  el.innerHTML = `<h2>My spots on ${esc(lake.name)}</h2>
+    ${mine.length ? `<ul class="list">${mine.map(row).join('')}</ul>` : '<p class="muted small">No saved spots on this lake yet. Tap "Save a spot where I am" on the water, or long-press the map.</p>'}
+    ${other.length ? `<h3>Not on one of your lakes</h3><ul class="list">${other.map(row).join('')}</ul>` : ''}
+    <p class="small muted">Spots are private and saved on this phone only. MDC attractor data downloaded ${esc(attractorOverrides[lake.id] ? ymd(attractorOverrides[lake.id].importedAt) + ' (your import)' : ATTRACTOR_SOURCE.downloaded)}.</p>`;
+}
+
+function onMapGeo() {
+  if (!mapState.ctl) return;
+  if (here) {
+    mapState.ctl.setMe(here);
+    if (mapState.centerOnFix) { mapState.centerOnFix = false; mapState.follow = true; mapState.ctl.flyTo(here.lat, here.lon, 16); }
+    else if (mapState.follow) mapState.ctl.map.panTo([here.lat, here.lon], { animate: true });
+  }
+  if (Date.now() - mapState.listAt > 10000) mapChrome();
+}
+
+async function renderMapTab() {
+  const main = $('#main');
+  if (!mapState.lakeId) mapState.lakeId = plan.lakeId;
+  if (!$('#map', main)) {
+    mapState.ctl = null;
+    main.innerHTML = `
+      <section class="card mapcard">
+        <div class="chips scroll" id="map-lakes" role="group" aria-label="Lake"></div>
+        <div class="mapbox">
+          <div id="map" aria-label="Map"></div>
+          <div class="map-btns">
+            <button class="mapbtn" id="mapbase" data-act="mapbase">Street</button>
+            <button class="mapbtn" data-act="mapme" aria-label="Center on my location">◎ Me</button>
+          </div>
+        </div>
+        <div class="chips" id="map-layers" role="group" aria-label="Layers"></div>
+        <p class="small muted" id="map-hint"></p>
+      </section>
+      <button class="btn big" data-act="spothere">+ Save a spot where I am</button>
+      <section class="card" id="map-spots"></section>`;
+  }
+  mapChrome();
+  geoSubscribe('map', onMapGeo);
+  if (mapState.ctl) { mapRefreshLayers(); return; }
+  if (mapState.creating) return;
+  mapState.creating = true;
+  const el = $('#map');
+  try {
+    const ctl = await createMap(el, {
+      view: mapState.view, base: mapState.base,
+      handlers: {
+        onLongPress: (lat, lon) => openSpotForm({ lat, lon }),
+        onSpot: (id) => openSpotSheet(id),
+        onUserMove: () => { mapState.follow = false; },
+        onAction: (btn) => { const fn = actions[btn.dataset.act]; if (fn) fn(btn); },
+      },
+    });
+    if (route() !== 'map' || !document.body.contains(el)) { ctl.destroy(); return; }
+    mapState.ctl = ctl;
+    ctl.map.on('zoomend moveend', () => { mapState.view = ctl.view(); mapChrome(); });
+    if (!mapState.view) ctl.fitBounds(lakeById(mapState.lakeId).bounds);
+    if (mapState.pendingFly) { ctl.flyTo(mapState.pendingFly.lat, mapState.pendingFly.lon, 17); mapState.pendingFly = null; }
+    mapRefreshLayers();
+    mapChrome();
+  } catch (e) {
+    el.innerHTML = `<p class="pad">The map couldn't load (${esc(e.message)}). It needs a signal the first time; after that it works offline. Your spots are listed below.</p>`;
+  } finally { mapState.creating = false; }
+}
+
+function showOnMap(lat, lon, lakeId) {
+  if (lakeId) mapState.lakeId = lakeId;
+  if (route() === 'map' && mapState.ctl) { mapState.follow = false; mapState.ctl.flyTo(lat, lon, 17); mapChrome(); mapRefreshLayers(); return; }
+  mapState.pendingFly = { lat, lon };
+  location.hash = '#map';
+}
+
+// ---------- spot form & sheet ----------
+function openSpotForm(draft) {
+  const existing = draft.id ? spotById(draft.id) : null;
+  const s = existing || { name: '', type: 'other', depthFt: null, notes: '', ...draft };
+  if (!existing && !s.lakeId) s.lakeId = lakeForPoint(lakes(), s);
+  const dlg = $('#sheet');
+  dlg.innerHTML = `<form method="dialog" id="spotform" class="form">
+    <h2>${existing ? 'Edit spot' : 'Save a spot'}</h2>
+    <label>Name <input name="name" value="${esc(s.name)}" placeholder="e.g. North cove brush pile" maxlength="60"></label>
+    <div class="chips" role="group" aria-label="Type">${SPOT_TYPES.map((t) => `<label class="chip radio"><input type="radio" name="type" value="${t.id}" ${t.id === s.type ? 'checked' : ''}><span>${t.icon} ${esc(t.name)}</span></label>`).join('')}</div>
+    <div class="row">
+      <label>Lake <select name="lakeId"><option value="">Other</option>${lakes().map((l) => `<option value="${l.id}" ${l.id === s.lakeId ? 'selected' : ''}>${esc(l.name)}</option>`).join('')}</select></label>
+      <label>Depth ft <input type="number" step="0.5" inputmode="decimal" name="depthFt" value="${s.depthFt ?? ''}"></label>
+    </div>
+    <div class="row">
+      <label>Latitude <input type="number" step="any" inputmode="decimal" name="lat" value="${s.lat != null ? s.lat.toFixed(6) : ''}" required></label>
+      <label>Longitude <input type="number" step="any" inputmode="decimal" name="lon" value="${s.lon != null ? s.lon.toFixed(6) : ''}" required></label>
+    </div>
+    <div class="row">
+      <button type="button" class="btn ghost" data-act="spotgps">📍 Use my location</button>
+      <span class="small muted" id="spotgpsinfo">${s.acc ? `GPS accuracy ±${Math.round(s.acc)} m` : ''}</span>
+    </div>
+    <label>Notes <textarea name="notes" rows="2" placeholder="what's here, how to approach it, best wind">${esc(s.notes)}</textarea></label>
+    <div class="row sticky">
+      <button type="button" class="btn ghost" data-act="closesheet">Cancel</button>
+      ${existing ? `<button type="button" class="btn danger" data-act="delspot" data-id="${existing.id}">Delete</button>` : ''}
+      <button type="submit" class="btn">Save</button>
+    </div>
+  </form>`;
+  if (!dlg.open) dlg.showModal();
+
+  $('#spotform').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const f = new FormData(ev.target);
+    const lat = num(f.get('lat')), lon = num(f.get('lon'));
+    if (lat == null || lon == null || Math.abs(lat) > 90 || Math.abs(lon) > 180) { toast('Enter a valid latitude and longitude'); return; }
+    const type = f.get('type') || 'other';
+    const rec = existing ? { ...existing } : { id: uid(), createdAt: Date.now() };
+    rec.lat = lat; rec.lon = lon; rec.type = type;
+    rec.lakeId = f.get('lakeId') || null;
+    rec.depthFt = num(f.get('depthFt'));
+    rec.notes = f.get('notes').trim();
+    rec.name = f.get('name').trim() || `${spotType(type).name} ${data.spots.filter((x) => x.type === type).length + (existing ? 0 : 1)}`;
+    rec.updatedAt = Date.now();
+    await db.put('spots', rec);
+    dlg.close();
+    await loadData();
+    if (route() === 'map') { if (rec.lakeId && rec.lakeId !== mapState.lakeId) mapState.lakeId = rec.lakeId; mapRefreshLayers(); mapChrome(); } else render();
+    toast(existing ? 'Spot updated' : `Saved "${rec.name}"`);
+  });
+}
+
+async function spotFormGps() {
+  const info = $('#spotgpsinfo');
+  info.textContent = 'Getting location…';
+  try {
+    const p = await currentPosition();
+    const f = $('#spotform'); if (!f) return;
+    f.lat.value = p.lat.toFixed(6); f.lon.value = p.lon.toFixed(6);
+    const lk = lakeForPoint(lakes(), p);
+    if (lk) f.lakeId.value = lk;
+    info.textContent = `GPS accuracy ±${Math.round(p.acc)} m`;
+  } catch (e) { info.textContent = `No location: ${e.message}`; }
+}
+
+// Compass for the "guide me" arrow (Android Chrome gives true-north heading via deviceorientationabsolute).
+let compass = null;
+const onOrient = (e) => { if (e.absolute && e.alpha != null) { compass = (360 - e.alpha + (screen.orientation ? screen.orientation.angle : 0)) % 360; updateGuide(); } };
+
+let guideSpot = null;
+function updateGuide() {
+  const el = $('#guide');
+  if (!el || !guideSpot) return;
+  if (!here) { el.innerHTML = `<div class="guide-txt">${geoError ? `No location: ${esc(geoError)}` : 'Waiting for GPS…'}</div>`; return; }
+  const d = distM(here, guideSpot), b = bearing(here, guideSpot);
+  const moving = here.speed != null && here.speed > 1.5 && here.heading != null && !Number.isNaN(here.heading);
+  const heading = moving ? here.heading : compass;
+  const rot = heading != null ? b - heading : b;
+  const onIt = d <= Math.max(12, here.acc || 0);
+  el.innerHTML = `
+    <div class="guide-arrow" style="transform:rotate(${Math.round(rot)}deg)" aria-hidden="true">${onIt ? '◎' : '⬆'}</div>
+    <div class="guide-txt">
+      <div class="guide-dist">${onIt ? "You're on it" : fmtDist(d)}</div>
+      <div>${Math.round(b)}° ${cardinal(b)} · GPS ±${Math.round(here.acc)} m</div>
+      <div class="small muted">${heading == null ? 'Arrow: north is up (no compass reading)' : moving ? 'Arrow follows the boat’s direction of travel' : 'Arrow uses the phone compass (keep it flat, away from the motor)'}</div>
+    </div>`;
+}
+
+function openSpotSheet(id) {
+  const s = spotById(id);
+  if (!s) return;
+  const t = spotType(s.type);
+  const cs = catchesAtSpot(s);
+  const trips = new Set(cs.map((c) => c.tripId)).size;
+  const count = (key) => { const m = {}; for (const c of cs) { const k = key(c); if (k) m[k] = (m[k] || 0) + 1; } return Object.entries(m).sort((a, b) => b[1] - a[1]); };
+  const bySp = count((c) => speciesName(c.species));
+  const byLure = count((c) => `${lureLabel(c.lureType)}${c.color ? `, ${c.color}` : ''}`).slice(0, 3);
+  const dlg = $('#sheet');
+  dlg.innerHTML = `<div class="form">
+    <h2>${t.icon} ${esc(s.name)}</h2>
+    <p class="small muted">${esc(t.name)}${s.depthFt != null ? ` · ${s.depthFt} ft` : ''} · ${esc(s.lakeId ? lakeById(s.lakeId).name : 'Other')} · ${s.lat.toFixed(5)}, ${s.lon.toFixed(5)}</p>
+    ${s.notes ? `<p>${esc(s.notes)}</p>` : ''}
+    <div class="guide" id="guide"></div>
+    <h3>Fish here</h3>
+    ${cs.length ? `<p><b>${cs.length}</b> fish on <b>${trips}</b> trip${trips === 1 ? '' : 's'}${trips < 3 ? ' <span class="tag">small sample</span>' : ''}. Last one ${fmtDate(cs[0].time)}.</p>
+      <p class="small">${bySp.map(([k, n]) => `${esc(k)}: ${n}`).join(' · ')}</p>
+      ${byLure.length ? `<p class="small"><b>Top baits:</b> ${byLure.map(([k, n]) => `${esc(k)} (${n})`).join('; ')}</p>` : ''}
+      ${catchList(cs.slice(0, 5))}`
+      : `<p class="small muted">No fish logged here yet. Fish count toward this spot when you pick it in the catch form or save their GPS within about ${Math.round(SPOT_RADIUS_M * 1.09)} yards.</p>`}
+    <div class="row sticky">
+      <button type="button" class="btn ghost" data-act="closesheet">Close</button>
+      <a class="btn ghost" href="https://www.google.com/maps/dir/?api=1&destination=${s.lat},${s.lon}" target="_blank" rel="noopener">Drive</a>
+      <button type="button" class="btn ghost" data-act="spotonmap" data-id="${s.id}">Map</button>
+      <button type="button" class="btn" data-act="editspot" data-id="${s.id}">Edit</button>
+    </div>
+  </div>`;
+  if (!dlg.open) dlg.showModal();
+  guideSpot = s;
+  updateGuide();
+  geoSubscribe('guide', updateGuide);
+  window.addEventListener('deviceorientationabsolute', onOrient);
+  const stop = () => {
+    // the sheet's content may be swapped (Edit, a catch) while it stays open; stop guiding once it's gone
+    if (dlg.open && $('#guide')) return;
+    guideSpot = null; compass = null;
+    geoUnsubscribe('guide');
+    window.removeEventListener('deviceorientationabsolute', onOrient);
+    dlg.removeEventListener('close', stop);
+    mo.disconnect();
+  };
+  const mo = new MutationObserver(stop);
+  mo.observe(dlg, { childList: true });
+  dlg.addEventListener('close', stop);
 }
 window.addEventListener('hashchange', () => { render(); window.scrollTo(0, 0); });
 
@@ -276,7 +622,7 @@ function catchList(cs) {
     <button class="rowbtn" data-act="editfish" data-id="${c.id}">
       <b>${esc(speciesName(c.species))}</b>${c.lengthIn ? ` ${c.lengthIn}"` : ''}${c.weightLb ? ` ${c.weightLb} lb` : ''}
       <span class="small">${esc(lureLabel(c.lureType))}${c.lureName ? ` (${esc(c.lureName)})` : ''}${c.color ? `, ${esc(c.color)}` : ''}${c.depthFt != null ? ` · ${c.depthFt} ft` : ''}</span>
-      <span class="small muted">${fmtTime(c.time)}${c.weather ? ` · ${c.weather.windMph ?? '?'} mph ${esc(c.weather.windDir || '')}` : ''}${c.lat ? ' · 📍' : ''}${c.photoId ? ' · 📷' : ''}</span>
+      <span class="small muted">${fmtTime(c.time)}${c.weather ? ` · ${c.weather.windMph ?? '?'} mph ${esc(c.weather.windDir || '')}` : ''}${c.spotId && spotById(c.spotId) ? ` · 📍 ${esc(spotById(c.spotId).name)}` : c.lat ? ' · 📍' : ''}${c.photoId ? ' · 📷' : ''}</span>
     </button></li>`).join('')}</ul>`;
 }
 
@@ -351,7 +697,7 @@ async function openCatchForm({ tripId, catchId }) {
   const photoUrl = existing && existing.photoId ? await photoURL(existing.photoId) : null;
 
   const dlg = $('#sheet');
-  dlg.innerHTML = `<form method="dialog" id="catchform" class="form">
+  dlg.innerHTML = `<form method="dialog" id="catchform" class="form" data-trip="${trip.id}">
     <h2>${existing ? 'Edit fish' : 'Log a fish'}</h2>
     <div class="chips" role="group" aria-label="Species">${ALL_SPECIES.map((s) => `<label class="chip radio"><input type="radio" name="species" value="${s.id}" ${s.id === c.species ? 'checked' : ''}><span>${esc(s.name)}</span></label>`).join('')}</div>
     <label>Lure / bait <select name="lureType" required>
@@ -379,6 +725,7 @@ async function openCatchForm({ tripId, catchId }) {
       <span class="small muted" id="gpsinfo">${c.lat ? `${c.lat.toFixed(5)}, ${c.lon.toFixed(5)}` : 'Private, saved on this phone only'}</span>
     </div>
     <input type="hidden" name="lat" value="${c.lat ?? ''}"><input type="hidden" name="lon" value="${c.lon ?? ''}">
+    <label>Spot <select name="spotId">${catchSpotOptions(trip.lakeId, c.lat != null ? c : here, c.spotId)}</select></label>
     <label>Photo <input type="file" name="photo" accept="image/*" capture="environment"></label>
     ${photoUrl ? `<img src="${photoUrl}" class="thumb" alt="Catch photo">` : ''}
     <label>Notes <input name="notes" value="${esc(c.notes || '')}" placeholder="spot, structure, etc."></label>
@@ -388,7 +735,7 @@ async function openCatchForm({ tripId, catchId }) {
       <button type="submit" class="btn">Save</button>
     </div>
   </form>`;
-  dlg.showModal();
+  if (!dlg.open) dlg.showModal();
   if (!existing && settings.autoGps) getGps();
 
   $('#catchform').addEventListener('submit', async (ev) => {
@@ -407,6 +754,7 @@ async function openCatchForm({ tripId, catchId }) {
     rec.released = !!f.get('released');
     rec.time = fromLocalInput(f.get('time')) || new Date().toISOString();
     rec.lat = num(f.get('lat')); rec.lon = num(f.get('lon'));
+    rec.spotId = f.get('spotId') || null;
     rec.notes = f.get('notes').trim();
     rec.month = new Date(rec.time).getMonth() + 1;
     const ph = pickPhase(rec.species, rec.month, trip.waterTemp);
@@ -439,8 +787,24 @@ function getGps() {
     const f = $('#catchform');
     if (!f) return;
     f.lat.value = p.coords.latitude; f.lon.value = p.coords.longitude;
-    info.textContent = `${p.coords.latitude.toFixed(5)}, ${p.coords.longitude.toFixed(5)} (±${Math.round(p.coords.accuracy)} m)`;
+    const pos = { lat: p.coords.latitude, lon: p.coords.longitude };
+    info.textContent = `${pos.lat.toFixed(5)}, ${pos.lon.toFixed(5)} (±${Math.round(p.coords.accuracy)} m)`;
+    // re-sort the spot list by distance and pick the nearest saved spot if it's close
+    const sel = f.spotId, chosen = sel.value;
+    const trip = tripById(f.dataset.trip);
+    sel.innerHTML = catchSpotOptions(trip ? trip.lakeId : null, pos, chosen);
+    if (!chosen) {
+      const near = data.spots.map((s) => [s, distM(pos, s)]).filter(([, d]) => d <= SPOT_RADIUS_M).sort((a, b) => a[1] - b[1])[0];
+      if (near) { sel.value = near[0].id; info.textContent += ` · at ${near[0].name}`; }
+    }
   }, (e) => { info.textContent = `No location: ${e.message}`; }, { enableHighAccuracy: true, timeout: 15000, maximumAge: 30000 });
+}
+
+/** <option>s for the catch form's Spot picker: this lake's spots, nearest first when we know where we are. */
+function catchSpotOptions(lakeId, pos, selected) {
+  let list = data.spots.filter((s) => s.lakeId === lakeId || s.id === selected);
+  if (pos && pos.lat != null) list = list.map((s) => ({ s, d: distM(pos, s) })).sort((a, b) => a.d - b.d).map((x) => ({ ...x.s, _d: x.d }));
+  return `<option value="">None</option>${list.map((s) => `<option value="${s.id}" ${s.id === selected ? 'selected' : ''}>${spotType(s.type).icon} ${esc(s.name)}${s._d != null ? ` (${fmtDist(s._d)})` : ''}</option>`).join('')}`;
 }
 
 async function compressImage(file, max = 1280) {
@@ -462,7 +826,7 @@ async function photoURL(id) {
 // ---------- STATS ----------
 let statsSpecies = '';
 async function renderStats() {
-  const s = computeStats(data.trips, enrichedCatches(), lakes(), statsSpecies);
+  const s = computeStats(data.trips, enrichedCatches(), lakes(), statsSpecies, spotForCatch);
   const table = (rows, rate = true) => rows.length ? `<table><thead><tr><th></th><th>Fish</th><th>Trips</th>${rate ? '<th>Hours</th><th>Fish/hr</th>' : ''}</tr></thead><tbody>
     ${rows.map((r) => `<tr class="${smallSample(r) ? 'thin' : ''}"><td>${esc(r.label)}${smallSample(r) ? ' <span class="tag">small sample</span>' : ''}</td><td>${r.fish}</td><td>${r.trips}</td>${rate ? `<td>${round1(r.hours)}</td><td><b>${r.perHour == null ? '–' : round1(r.perHour)}</b></td>` : ''}</tr>`).join('')}
   </tbody></table>` : '<p class="muted small">Nothing yet.</p>';
@@ -476,6 +840,7 @@ async function renderStats() {
     <section class="card"><h3>By lake</h3>${table(s.byLake)}</section>
     <section class="card"><h3>By lure (fish caught)</h3>${table(s.byLure.slice(0, 12), false)}</section>
     <section class="card"><h3>By lure + color</h3>${table(s.byLureColor.slice(0, 12), false)}</section>
+    ${data.spots.length ? `<section class="card"><h3>By spot (fish caught)</h3>${table(s.bySpot.slice(0, 12), false)}<p class="small muted">A fish counts toward a spot if you picked the spot when logging it, or its GPS is within about ${Math.round(SPOT_RADIUS_M * 1.09)} yards.</p></section>` : ''}
     ${!statsSpecies ? `<section class="card"><h3>By species</h3>${table(s.bySpecies, false)}</section>` : ''}
     <section class="card"><h3>By month</h3>${table(s.byMonth)}</section>
     <section class="card"><h3>By wind at trip start</h3>${table(s.byWind)}</section>
@@ -505,6 +870,23 @@ async function renderMore() {
         <label class="btn ghost">Restore backup… <input type="file" id="restore" accept="application/json,.json" hidden></label>
       </div>
       <p class="small muted">Storage: ${persisted ? 'protected from automatic cleanup' : 'not yet protected. Install the app to your home screen.'}${est ? ` · ${est}` : ''}</p>
+    </section>
+
+    <section class="card">
+      <h2>Spots &amp; map data</h2>
+      <p class="small">You have <b>${data.spots.length}</b> saved spot${data.spots.length === 1 ? '' : 's'}. GPX is the standard waypoint file that most GPS units, fish finders and mapping apps can read.</p>
+      <div class="row">
+        <button class="btn ghost" data-act="gpx-spots" ${data.spots.length ? '' : 'disabled'}>Export my spots (.gpx)</button>
+        <button class="btn ghost" data-act="gpx-catches">Export catches with GPS (.gpx)</button>
+        <label class="btn ghost">Import GPX as my spots… <input type="file" id="import-spots" accept=".gpx,.zip,application/gpx+xml,application/zip" hidden></label>
+      </div>
+      <h3>MDC fish attractors</h3>
+      <p class="small">Built in: MDC's attractor files for all six lakes, downloaded ${ATTRACTOR_SOURCE.downloaded}. MDC adds new brush piles every year. To refresh, download a lake's file from the <a href="${ATTRACTOR_SOURCE.url}" target="_blank" rel="noopener">MDC attractor page</a> and load it here. A .zip file is fine.</p>
+      <ul class="small">${lakes().map((l) => `<li>${esc(l.name)}: ${attractorsFor(l.id).length}${attractorOverrides[l.id] ? ` (your import, ${ymd(attractorOverrides[l.id].importedAt)})` : ''}</li>`).join('')}</ul>
+      <div class="row">
+        <label class="btn ghost">Update MDC attractors… <input type="file" id="import-attractors" accept=".gpx,.zip,application/gpx+xml,application/zip" hidden></label>
+        ${Object.keys(attractorOverrides).length ? '<button class="btn ghost" data-act="resetattractors">Go back to built-in data</button>' : ''}
+      </div>
     </section>
 
     <section class="card">
@@ -542,7 +924,7 @@ async function renderMore() {
     <section class="card small">
       <h2>About</h2>
       <p>Weather comes from the National Weather Service (api.weather.gov), with no account or tracking. Fishing info links go to official Missouri Department of Conservation pages. The app does <b>not</b> know where fish are, and it does not show regulations.</p>
-      <p>Privacy: trips, catches, GPS spots, and photos are stored on this device only. Nothing is uploaded. The only network calls are to the NWS for weather.</p>
+      <p>Privacy: trips, catches, saved spots, and photos are stored on this device only. Nothing is uploaded. The app contacts the NWS for weather and, when the map is open, the map tile servers (Esri for satellite and OpenStreetMap for streets). Those servers see which map area is being viewed, like any map website, but never your spots or catches. Fish attractor locations are from MDC.</p>
       <p class="muted">Version <span id="ver"></span></p>
     </section>`;
 }
@@ -562,7 +944,7 @@ const blobToDataURL = (b) => new Promise((res) => { const r = new FileReader(); 
 async function exportBackup(withPhotos) {
   const photos = [];
   if (withPhotos) for (const p of await db.all('photos')) photos.push({ id: p.id, dataUrl: await blobToDataURL(p.blob) });
-  const out = { app: 'fishing-intel', version: 1, exportedAt: new Date().toISOString(), settings, trips: data.trips, catches: data.catches, photos };
+  const out = { app: 'fishing-intel', version: 2, exportedAt: new Date().toISOString(), settings, trips: data.trips, catches: data.catches, spots: data.spots, attractorOverrides, photos };
   download(`fishing-backup-${ymd(Date.now())}.json`, JSON.stringify(out), 'application/json');
   await db.kvSet('lastBackup', Date.now());
 }
@@ -574,17 +956,69 @@ async function importBackup(file) {
   let newTrips = 0;
   for (const t of j.trips || []) { if (!existing.has(t.id)) newTrips++; await db.put('trips', t); }
   for (const c of j.catches || []) await db.put('catches', c);
+  for (const s of j.spots || []) await db.put('spots', s);
+  if (j.attractorOverrides && typeof j.attractorOverrides === 'object') {
+    attractorOverrides = { ...attractorOverrides, ...j.attractorOverrides };
+    await db.kvSet('attractorOverrides', attractorOverrides);
+  }
   for (const p of j.photos || []) { const blob = await (await fetch(p.dataUrl)).blob(); await db.put('photos', { id: p.id, blob, type: blob.type }); }
   await loadData();
-  return { trips: (j.trips || []).length, catches: (j.catches || []).length, newTrips };
+  return { trips: (j.trips || []).length, catches: (j.catches || []).length, spots: (j.spots || []).length, newTrips };
+}
+
+function exportSpotsGPX() {
+  const pts = data.spots.map((s) => ({ lat: s.lat, lon: s.lon, name: s.name, time: new Date(s.createdAt).toISOString(),
+    desc: [spotType(s.type).name, s.depthFt != null ? `${s.depthFt} ft` : '', s.lakeId ? lakeById(s.lakeId).name : '', s.notes].filter(Boolean).join(' · ') }));
+  download(`fishing-spots-${ymd(Date.now())}.gpx`, toGPX(pts), 'application/gpx+xml');
+}
+function exportCatchesGPX() {
+  const pts = enrichedCatches().map((c) => {
+    const p = catchPos(c);
+    if (!p) return null;
+    return { ...p, time: c.time, name: `${speciesName(c.species)}${c.lengthIn ? ` ${c.lengthIn}in` : ''}`,
+      desc: [lureLabel(c.lureType), c.lureName, c.color, c.depthFt != null ? `${c.depthFt} ft` : '', fmtDate(c.time)].filter(Boolean).join(' · ') };
+  }).filter(Boolean);
+  if (!pts.length) { toast('No catches with a location yet'); return; }
+  download(`fishing-catches-${ymd(Date.now())}.gpx`, toGPX(pts), 'application/gpx+xml');
+}
+
+async function importSpotsFile(file) {
+  const wpts = await readWaypointsFile(file);
+  if (!wpts.length) throw new Error('No waypoints found in that file');
+  if (wpts.length > 300 && !confirm(`That file has ${wpts.length} points. Import them all as your own spots? (For MDC attractor files, use "Update MDC attractors" instead.)`)) return null;
+  let added = 0, skipped = 0;
+  for (const w of wpts) {
+    const name = (w.name || '').slice(0, 60) || 'Imported spot';
+    if (data.spots.some((s) => s.name === name && distM(s, w) < 5)) { skipped++; continue; }
+    const rec = { id: uid(), name, type: 'other', lat: w.lat, lon: w.lon, lakeId: lakeForPoint(lakes(), w), depthFt: null, notes: w.desc || '', createdAt: Date.now(), updatedAt: Date.now(), imported: file.name };
+    await db.put('spots', rec); data.spots.push(rec); added++;
+  }
+  await loadData();
+  return { added, skipped };
+}
+
+async function importAttractorsFile(file) {
+  const wpts = await readWaypointsFile(file);
+  const byLake = {};
+  let outside = 0;
+  for (const w of wpts) {
+    const lk = lakeForPoint(lakes(), w);
+    if (!lk) { outside++; continue; }
+    (byLake[lk] ||= []).push([Math.round(w.lat * 1e6) / 1e6, Math.round(w.lon * 1e6) / 1e6, w.desc && w.desc !== 'NA' ? w.desc : '']);
+  }
+  const ids = Object.keys(byLake);
+  if (!ids.length) throw new Error(`None of the ${wpts.length} points are on one of your lakes`);
+  for (const id of ids) attractorOverrides[id] = { points: byLake[id], importedAt: Date.now(), file: file.name };
+  await db.kvSet('attractorOverrides', attractorOverrides);
+  return { lakes: ids.map((id) => `${lakeById(id).name} (${byLake[id].length})`), outside };
 }
 
 function exportCatchesCSV() {
-  const head = ['date', 'time', 'lake', 'species', 'length_in', 'weight_lb', 'lure_type', 'lure_name', 'color', 'depth_ft', 'released', 'phase', 'wind_mph', 'wind_from', 'gust_mph', 'air_f', 'sky', 'weather_source', 'clarity', 'water_f', 'lat', 'lon', 'notes', 'trip_id', 'catch_id'];
+  const head = ['date', 'time', 'lake', 'species', 'length_in', 'weight_lb', 'lure_type', 'lure_name', 'color', 'depth_ft', 'released', 'phase', 'wind_mph', 'wind_from', 'gust_mph', 'air_f', 'sky', 'weather_source', 'clarity', 'water_f', 'lat', 'lon', 'spot', 'notes', 'trip_id', 'catch_id'];
   const rows = enrichedCatches().map((c) => {
     const t = tripById(c.tripId) || {};
     const w = c.weather || {};
-    return [ymd(c.time), fmtTime(c.time), lakeById(c.lakeId).name, speciesName(c.species), c.lengthIn, c.weightLb, lureLabel(c.lureType), c.lureName, c.color, c.depthFt, c.released ? 'yes' : 'no', c.phase, w.windMph, w.windDir, w.gustMph, w.tempF, w.sky, w.source, c.clarity, t.waterTemp, c.lat, c.lon, c.notes, c.tripId, c.id];
+    return [ymd(c.time), fmtTime(c.time), lakeById(c.lakeId).name, speciesName(c.species), c.lengthIn, c.weightLb, lureLabel(c.lureType), c.lureName, c.color, c.depthFt, c.released ? 'yes' : 'no', c.phase, w.windMph, w.windDir, w.gustMph, w.tempF, w.sky, w.source, c.clarity, t.waterTemp, c.lat, c.lon, (spotForCatch(c) || {}).name, c.notes, c.tripId, c.id];
   });
   download(`catches-${ymd(Date.now())}.csv`, toCSV([head, ...rows]), 'text/csv');
 }
@@ -634,6 +1068,49 @@ const actions = {
   'csv-catches': () => exportCatchesCSV(),
   'csv-trips': () => exportTripsCSV(),
   resetlake: (el) => { delete settings.lakeOverrides[el.dataset.v]; saveSettings(); wxCache = {}; render(); },
+  // map & spots
+  maplake: (el) => {
+    mapState.lakeId = el.dataset.v; mapState.follow = false; saveMapPrefs();
+    if (mapState.ctl) { mapState.ctl.fitBounds(lakeById(mapState.lakeId).bounds); mapRefreshLayers(); }
+    mapChrome();
+  },
+  maplayer: (el) => { const k = el.dataset.v; mapState.show[k] = !mapState.show[k]; if (mapState.ctl) mapState.ctl.show(k, mapState.show[k]); saveMapPrefs(); mapChrome(); },
+  mapbase: () => { mapState.base = mapState.base === 'sat' ? 'street' : 'sat'; if (mapState.ctl) mapState.ctl.setBase(mapState.base); saveMapPrefs(); mapChrome(); },
+  mapme: () => {
+    if (!mapState.ctl) return;
+    if (here && Date.now() - here.t < 60000) { mapState.follow = true; mapState.ctl.flyTo(here.lat, here.lon, 16); }
+    else { mapState.centerOnFix = true; toast(geoError ? `Location: ${geoError}` : 'Getting your location…'); }
+  },
+  spothere: async () => {
+    toast('Getting your location…', 15000);
+    try { const p = await currentPosition(); $('#toast').hidden = true; openSpotForm({ lat: p.lat, lon: p.lon, acc: p.acc }); }
+    catch (e) { toast(`No location: ${e.message}`); }
+  },
+  attr2spot: (el) => {
+    if (mapState.ctl) mapState.ctl.map.closePopup();
+    openSpotForm({ lat: +el.dataset.lat, lon: +el.dataset.lon, type: 'brush', name: `MDC ${el.dataset.desc || 'attractor'}`.slice(0, 60), notes: 'MDC fish attractor' });
+  },
+  openspot: (el) => openSpotSheet(el.dataset.id),
+  editspot: (el) => openSpotForm({ id: el.dataset.id }),
+  spotgps: () => spotFormGps(),
+  spotonmap: (el) => { const s = spotById(el.dataset.id); $('#sheet').close(); if (s) showOnMap(s.lat, s.lon, s.lakeId); },
+  delspot: async (el) => {
+    const s = spotById(el.dataset.id);
+    if (!s || !confirm(`Delete the spot "${s.name}"? Fish logged there are kept.`)) return;
+    for (const c of data.catches.filter((x) => x.spotId === s.id)) {
+      // keep the location on fish that only had the spot's position
+      if (c.lat == null) { c.lat = s.lat; c.lon = s.lon; }
+      c.spotId = null; await db.put('catches', c);
+    }
+    await db.del('spots', s.id);
+    $('#sheet').close(); await loadData(); render(); toast('Spot deleted');
+  },
+  'gpx-spots': () => exportSpotsGPX(),
+  'gpx-catches': () => exportCatchesGPX(),
+  resetattractors: async () => {
+    if (!confirm('Go back to the MDC attractor data built into the app?')) return;
+    attractorOverrides = {}; await db.kvSet('attractorOverrides', {}); render(); toast('Using built-in MDC data');
+  },
 };
 
 document.addEventListener('click', (ev) => {
@@ -672,9 +1149,23 @@ document.addEventListener('change', async (ev) => {
   } else if (el.id === 'restore' && el.files[0]) {
     try {
       const r = await importBackup(el.files[0]);
-      toast(`Restored ${r.trips} trips (${r.newTrips} new), ${r.catches} fish`);
+      toast(`Restored ${r.trips} trips (${r.newTrips} new), ${r.catches} fish, ${r.spots} spots`);
       render();
     } catch (e) { alert(`Restore failed: ${e.message}`); }
+  } else if (el.id === 'import-spots' && el.files[0]) {
+    try {
+      const r = await importSpotsFile(el.files[0]);
+      if (r) toast(`Added ${r.added} spot${r.added === 1 ? '' : 's'}${r.skipped ? ` (${r.skipped} already saved)` : ''}`, 4000);
+      render();
+    } catch (e) { alert(`Import failed: ${e.message}`); }
+    el.value = '';
+  } else if (el.id === 'import-attractors' && el.files[0]) {
+    try {
+      const r = await importAttractorsFile(el.files[0]);
+      toast(`Updated MDC attractors: ${r.lakes.join(', ')}${r.outside ? `. ${r.outside} points weren't on your lakes and were skipped` : ''}`, 5000);
+      render();
+    } catch (e) { alert(`Import failed: ${e.message}`); }
+    el.value = '';
   }
 });
 
@@ -712,6 +1203,9 @@ async function boot() {
   if (s) settings = { ...DEFAULT_SETTINGS, ...s, lakeOverrides: s.lakeOverrides || {} };
   const p = await db.kvGet('plan');
   if (p) plan = { ...plan, ...p, dayOffset: 0 };
+  const mp = await db.kvGet('mapPrefs');
+  if (mp) mapState = { ...mapState, lakeId: mp.lakeId || null, base: mp.base || 'sat', show: { ...mapState.show, ...(mp.show || {}) }, view: mp.view || null };
+  attractorOverrides = (await db.kvGet('attractorOverrides')) || {};
   await loadData();
   $('#offline').hidden = navigator.onLine;
   await render();
@@ -730,4 +1224,4 @@ async function boot() {
 boot();
 
 // exported for quick testing in the console
-window._fish = { db, data: () => data, suggest, skyBucket };
+window._fish = { db, data: () => data, suggest, skyBucket, map: () => mapState };

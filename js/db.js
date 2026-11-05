@@ -1,7 +1,7 @@
 // Tiny IndexedDB wrapper. Everything is stored on this device only.
 const DB_NAME = 'fishing-intel';
-const DB_VERSION = 1;
-const STORES = ['trips', 'catches', 'photos', 'kv'];
+const DB_VERSION = 2; // v2 (2026-11-05): added 'spots'
+const STORES = ['trips', 'catches', 'photos', 'kv', 'spots'];
 
 let dbp;
 function open() {

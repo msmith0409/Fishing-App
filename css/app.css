@@ -138,3 +138,22 @@ dialog#sheet::backdrop { background: rgb(0 0 0 / .45); }
 #toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(84px + env(safe-area-inset-bottom)); background: var(--ink); color: var(--bg); padding: 10px 16px; border-radius: 10px; z-index: 20; max-width: 90vw; font-size: .95rem; }
 .row label:has(> input:not([type])), .row label:has(> input[type="datetime-local"]) { flex: 1 1 40%; }
 .row label:has(> input:not([type])) input { width: 100%; }
+
+/* ---------- map ---------- */
+.mapcard { padding: 8px; }
+.mapbox { position: relative; margin: 6px 0; }
+#map { height: min(62vh, 560px); min-height: 300px; border-radius: 10px; overflow: hidden; background: var(--chip); z-index: 0; }
+.map-btns { position: absolute; top: 8px; right: 8px; display: flex; flex-direction: column; gap: 6px; z-index: 2; }
+.mapbtn { background: var(--card); color: var(--ink); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; font: inherit; font-size: .9rem; font-weight: 600; min-height: 40px; box-shadow: 0 1px 4px rgb(0 0 0 / .3); cursor: pointer; }
+.spot-pin { width: 30px; height: 30px; border-radius: 50% 50% 50% 0; transform: rotate(-45deg); background: #1d4ed8; border: 2px solid #fff; box-shadow: 0 1px 4px rgb(0 0 0 / .5); display: flex; align-items: center; justify-content: center; }
+.spot-pin span { transform: rotate(45deg); font-size: 14px; line-height: 1; color: #fff; }
+.spot-pin.t-ramp { background: #0f766e; }
+.spot-pin.t-brush, .spot-pin.t-timber { background: #15803d; }
+.spot-label { position: absolute; left: 34px; top: 4px; white-space: nowrap; font: 600 12px/1.2 system-ui, sans-serif; color: #fff; text-shadow: 0 0 3px #000, 0 0 3px #000; pointer-events: none; }
+.leaflet-popup-content { font: 14px/1.4 system-ui, sans-serif; }
+.leaflet-popup-content .btn.small { min-height: 36px; padding: 6px 10px; margin-top: 6px; font-size: .9rem; }
+.leaflet-popup-content .muted { color: #5d6b60; }
+.guide { display: flex; align-items: center; gap: 14px; background: var(--mine-bg); border-radius: 12px; padding: 10px 12px; margin: 8px 0; min-height: 76px; }
+.guide-arrow { font-size: 3rem; line-height: 1; color: var(--mine); transition: transform .3s; width: 56px; text-align: center; }
+.guide-dist { font-size: 1.5rem; font-weight: 800; }
+.guide-txt { font-size: .92rem; }

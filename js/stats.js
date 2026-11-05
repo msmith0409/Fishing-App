@@ -20,7 +20,8 @@ function group(trips, catches, keyOfTrip) {
   return Object.entries(g).map(([key, v]) => ({ key, ...v, perHour: v.hours >= 0.5 ? v.fish / v.hours : null }));
 }
 
-export function computeStats(trips, catches, lakes, speciesFilter) {
+/** spotOf(catch) -> { id, name } | null, used for the "by spot" table. */
+export function computeStats(trips, catches, lakes, speciesFilter, spotOf = () => null) {
   const done = trips.filter((t) => t.end);
   const doneIds = new Set(done.map((t) => t.id));
   const cs = catches.filter((c) => doneIds.has(c.tripId) && (!speciesFilter || c.species === speciesFilter));
@@ -45,10 +46,13 @@ export function computeStats(trips, catches, lakes, speciesFilter) {
   const byLure = count((c) => c.lureType || 'other', lureLabel);
   const byLureColor = count((c) => `${c.lureType || 'other'}|${(c.color || '').toLowerCase()}`, (k) => { const [t, col] = k.split('|'); return `${lureLabel(t)}${col ? ` — ${col}` : ''}`; });
 
+  const spotNames = {};
+  const bySpot = count((c) => { const sp = spotOf(c); if (!sp) return '_none'; spotNames[sp.id] = sp.name; return sp.id; }, (k) => spotNames[k] || k).filter((r) => r.key !== '_none');
+
   const sized = cs.filter((c) => c.lengthIn);
   const biggest = [...sized].sort((a, b) => b.lengthIn - a.lengthIn).slice(0, 5);
 
-  return { trips: done.length, hours: totalHours, fish: cs.length, byLake, byMonth, byWind, bySky, bySpecies, byLure, byLureColor, biggest };
+  return { trips: done.length, hours: totalHours, fish: cs.length, byLake, byMonth, byWind, bySky, bySpecies, byLure, byLureColor, bySpot, biggest };
 }
 
 export const smallSample = (r) => (r.trips != null && r.trips < 3) || (r.hours != null && r.hours < 8);
